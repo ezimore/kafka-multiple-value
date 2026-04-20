@@ -27,6 +27,7 @@ import org.apache.kafka.clients.CommonClientConfigs
 import org.apache.kafka.clients.admin.EndpointType
 import org.apache.kafka.common.acl.AclOperation
 import org.apache.kafka.common.acl.AclOperation._
+import org.apache.kafka.common.compress.Compression
 import org.apache.kafka.common.config.ConfigResource
 import org.apache.kafka.common.errors._
 import org.apache.kafka.common.internals.Topic.{GROUP_METADATA_TOPIC_NAME, SHARE_GROUP_STATE_TOPIC_NAME, TRANSACTION_STATE_TOPIC_NAME, isInternal}
@@ -56,6 +57,7 @@ import org.apache.kafka.common.resource.{Resource, ResourceType}
 import org.apache.kafka.common.security.auth.{KafkaPrincipal, SecurityProtocol}
 import org.apache.kafka.common.security.token.delegation.{DelegationToken, TokenInformation}
 import org.apache.kafka.common.utils.{ProducerIdAndEpoch, Time}
+import org.apache.kafka.common.utils.BufferSupplier
 import org.apache.kafka.common.{Node, TopicIdPartition, TopicPartition, Uuid}
 import org.apache.kafka.coordinator.group.{Group, GroupConfig, GroupConfigManager, GroupCoordinator}
 import org.apache.kafka.coordinator.share.ShareCoordinator
@@ -63,6 +65,7 @@ import org.apache.kafka.metadata.{ConfigRepository, MetadataCache}
 import org.apache.kafka.security.DelegationTokenManager
 import org.apache.kafka.server.{ApiVersionManager, ClientMetricsManager, FetchManager, ProcessRole}
 import org.apache.kafka.server.authorizer._
+import org.apache.kafka.server.record.RecordFetchPlugin
 import org.apache.kafka.server.common.{GroupVersion, RequestLocal, ShareVersion, StreamsVersion, TransactionVersion}
 import org.apache.kafka.server.share.context.ShareFetchContext
 import org.apache.kafka.server.share.{ErroneousAndValidPartitionData, SharePartitionKey}
@@ -72,6 +75,7 @@ import org.apache.kafka.server.transaction.AddPartitionsToTxnManager
 import org.apache.kafka.storage.internals.log.{AppendOrigin, RecordValidationStats}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 
+import java.nio.ByteBuffer
 import java.util
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.{CompletableFuture, ConcurrentHashMap}
@@ -108,7 +112,8 @@ class KafkaApis(val requestChannel: RequestChannel,
                 val tokenManager: DelegationTokenManager,
                 val apiVersionManager: ApiVersionManager,
                 val clientMetricsManager: ClientMetricsManager,
-                val groupConfigManager: GroupConfigManager
+                val groupConfigManager: GroupConfigManager,
+                val recordFetchPlugins: java.util.List[RecordFetchPlugin] = java.util.Collections.emptyList[RecordFetchPlugin]()
 ) extends ApiRequestHandler with Logging {
 
   type ProduceResponseStats = Map[TopicIdPartition, RecordValidationStats]
@@ -124,6 +129,149 @@ class KafkaApis(val requestChannel: RequestChannel,
   def close(): Unit = {
     aclApis.close()
     info("Shutdown complete.")
+  }
+
+  /**
+   * Apply the RecordFetchPlugin chain to filter records for a given topic-partition.
+   * Returns the filtered MemoryRecords, or the original records if no plugins are active.
+   *
+   * For each record batch, iterates individual records and invokes the plugin chain.
+   * If a plugin returns null, remaining plugins are skipped and the record is excluded.
+   * Surviving records are rebuilt into new MemoryRecords preserving batch metadata.
+   *
+   * High watermark and log start offset are NOT affected by filtering.
+   */
+  private def applyRecordFetchPlugins(
+    records: Records,
+    topicPartition: TopicPartition,
+    principal: KafkaPrincipal,
+    topicConfig: java.util.Map[String, String]
+  ): Records = {
+    if (recordFetchPlugins.isEmpty) return records
+
+    // Determine which plugins are active for this topic
+    val activePlugins = new java.util.ArrayList[RecordFetchPlugin]()
+    recordFetchPlugins.forEach { plugin =>
+      if (plugin.isActiveForTopic(topicPartition.topic, topicConfig)) {
+        activePlugins.add(plugin)
+      }
+    }
+
+    if (activePlugins.isEmpty) return records
+
+    records match {
+      case memoryRecords: MemoryRecords =>
+        if (memoryRecords.sizeInBytes() == 0) return memoryRecords
+
+        val bufferSupplier = BufferSupplier.create()
+        try {
+          // Estimate output buffer size as same as input (may be smaller after filtering)
+          val outputBuffer = ByteBuffer.allocate(memoryRecords.sizeInBytes())
+          var hasFiltered = false
+
+          for (batch <- memoryRecords.batches().asScala) {
+            val magic = batch.magic()
+            val compression = Compression.of(batch.compressionType()).build()
+            val timestampType = batch.timestampType()
+            val baseOffset = batch.baseOffset()
+            val logAppendTime = if (timestampType == org.apache.kafka.common.record.TimestampType.LOG_APPEND_TIME) batch.maxTimestamp() else RecordBatch.NO_TIMESTAMP
+
+            // Collect surviving records for this batch
+            val survivingRecords = new java.util.ArrayList[Record]()
+            var batchHasFiltered = false
+            var batchHasTransformed = false
+
+            val iter = batch.streamingIterator(bufferSupplier)
+            try {
+              while (iter.hasNext) {
+                val record = iter.next()
+                var currentRecord: Record = record
+
+                // Apply plugin chain
+                var i = 0
+                var excluded = false
+                while (i < activePlugins.size() && !excluded) {
+                  val result = try {
+                    activePlugins.get(i).apply(principal, topicPartition, currentRecord)
+                  } catch {
+                    case e: Exception =>
+                      error(s"RecordFetchPlugin ${activePlugins.get(i).getClass.getName} threw exception " +
+                        s"for record at offset ${record.offset()} in $topicPartition, excluding record", e)
+                      null
+                  }
+                  if (result == null) {
+                    excluded = true
+                  } else {
+                    currentRecord = result
+                  }
+                  i += 1
+                }
+
+                if (excluded) {
+                  batchHasFiltered = true
+                  hasFiltered = true
+                } else {
+                  if (currentRecord ne record) {
+                    batchHasTransformed = true
+                    hasFiltered = true
+                  }
+                  survivingRecords.add(currentRecord)
+                }
+              }
+            } finally {
+              iter.close()
+            }
+
+            if (!batchHasFiltered && !batchHasTransformed) {
+              // No filtering or transformation in this batch — copy original batch bytes directly
+              batch.writeTo(outputBuffer)
+            } else if (!survivingRecords.isEmpty) {
+              // Some records survived — rebuild the batch
+              val builder = MemoryRecords.builder(
+                outputBuffer, magic, compression, timestampType, baseOffset, logAppendTime,
+                batch.producerId(), batch.producerEpoch(), batch.baseSequence(),
+                batch.isTransactional, batch.isControlBatch, batch.partitionLeaderEpoch()
+              )
+              survivingRecords.forEach(r => builder.append(r))
+              builder.close()
+            }
+            // If all records were filtered out, skip the batch entirely
+          }
+
+          if (!hasFiltered) {
+            // No records were filtered, return original records unchanged
+            memoryRecords
+          } else {
+            outputBuffer.flip()
+            MemoryRecords.readableRecords(outputBuffer)
+          }
+        } finally {
+          bufferSupplier.close()
+        }
+
+      case fileRecords: org.apache.kafka.common.record.internal.FileRecords =>
+        // Convert FileRecords to MemoryRecords so we can apply the plugin chain.
+        // FileRecords are zero-copy reads from the log segment and need to be
+        // materialized into memory for per-record plugin processing.
+        val size = fileRecords.sizeInBytes()
+        if (size == 0) return fileRecords
+        val buffer = ByteBuffer.allocate(size)
+        try {
+          fileRecords.readInto(buffer, 0)
+        } catch {
+          case e: java.io.IOException =>
+            error(s"Failed to read FileRecords into memory for plugin filtering on $topicPartition", e)
+            return fileRecords
+        }
+        // readInto already calls buffer.flip(), so buffer is ready to read
+        val memRecords = MemoryRecords.readableRecords(buffer)
+        // Recursively call to process as MemoryRecords
+        applyRecordFetchPlugins(memRecords, topicPartition, principal, topicConfig)
+
+      case _ =>
+        // For other non-MemoryRecords types, return as-is
+        records
+    }
   }
 
   private def forwardToController(request: RequestChannel.Request): Unit = {
@@ -627,10 +775,32 @@ class KafkaApis(val requestChannel: RequestChannel,
       val partitions = new util.LinkedHashMap[TopicIdPartition, FetchResponseData.PartitionData]
       val reassigningPartitions = mutable.Set[TopicIdPartition]()
       val nodeEndpoints = new mutable.HashMap[Int, Node]
+      // Cache topic configs for plugin filtering to avoid repeated lookups
+      val topicConfigCache = new mutable.HashMap[String, java.util.Map[String, String]]()
+      val hasPlugins = !fetchRequest.isFromFollower && !recordFetchPlugins.isEmpty
       responsePartitionData.foreach { case (topicIdPartition, data) =>
         val abortedTransactions = data.abortedTransactions.orElse(null)
         val lastStableOffset: Long = data.lastStableOffset.orElse(FetchResponse.INVALID_LAST_STABLE_OFFSET)
         if (data.isReassignmentFetch) reassigningPartitions.add(topicIdPartition)
+
+        // Apply RecordFetchPlugin chain for consumer fetches when plugins are configured.
+        // High watermark and log start offset are NOT affected by filtering — they come from the log.
+        // Fetch position advances past filtered records because the consumer sees the last offset
+        // in the response and advances accordingly.
+        val filteredRecords = if (hasPlugins && data.records != null && data.error == Errors.NONE) {
+          val topicConfig = topicConfigCache.getOrElseUpdate(topicIdPartition.topic, {
+            val props = configRepository.topicConfig(topicIdPartition.topic)
+            val configMap = new java.util.HashMap[String, String]()
+            if (props != null) {
+              props.forEach((k, v) => configMap.put(k.toString, v.toString))
+            }
+            configMap
+          })
+          applyRecordFetchPlugins(data.records, topicIdPartition.topicPartition, request.context.principal, topicConfig)
+        } else {
+          data.records
+        }
+
         val partitionData = new FetchResponseData.PartitionData()
           .setPartitionIndex(topicIdPartition.partition)
           .setErrorCode(maybeDownConvertStorageError(data.error).code)
@@ -638,7 +808,7 @@ class KafkaApis(val requestChannel: RequestChannel,
           .setLastStableOffset(lastStableOffset)
           .setLogStartOffset(data.logStartOffset)
           .setAbortedTransactions(abortedTransactions)
-          .setRecords(data.records)
+          .setRecords(filteredRecords)
           .setPreferredReadReplica(data.preferredReadReplica.orElse(FetchResponse.INVALID_PREFERRED_REPLICA_ID))
 
         if (versionId >= 16) {

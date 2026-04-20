@@ -46,11 +46,12 @@ import org.apache.kafka.security.{CredentialProvider, DelegationTokenManager}
 import org.apache.kafka.server.FetchSession.FetchSessionCache
 import org.apache.kafka.server.authorizer.Authorizer
 import org.apache.kafka.server.common.{ApiMessageAndVersion, DirectoryEventHandler, NodeToControllerChannelManager, TopicIdPartition}
-import org.apache.kafka.server.config.{ConfigType, DelegationTokenManagerConfigs}
+import org.apache.kafka.server.config.{ConfigType, DelegationTokenManagerConfigs, ServerConfigs}
 import org.apache.kafka.server.log.remote.metadata.storage.BrokerReadyCallback
 import org.apache.kafka.server.log.remote.storage.{RemoteLogManager, RemoteLogManagerConfig}
 import org.apache.kafka.server.metrics.{ClientTelemetryExporterPlugin, KafkaYammerMetrics}
 import org.apache.kafka.server.network.{EndpointReadyFutures, KafkaAuthorizerServerInfo}
+import org.apache.kafka.server.record.RecordFetchPlugin
 import org.apache.kafka.server.share.persister.{DefaultStatePersister, NoOpStatePersister, Persister, PersisterStateManager}
 import org.apache.kafka.server.share.session.ShareSessionCache
 import org.apache.kafka.server.util.timer.{SystemTimer, SystemTimerReaper}
@@ -106,6 +107,7 @@ class BrokerServer(
   @volatile var dataPlaneRequestProcessor: KafkaApis = _
 
   var authorizerPlugin: Option[Plugin[Authorizer]] = None
+  var recordFetchPlugins: java.util.List[RecordFetchPlugin] = new java.util.ArrayList[RecordFetchPlugin]()
   @volatile var socketServer: SocketServer = _
   var dataPlaneRequestHandlerPool: KafkaRequestHandlerPool = _
 
@@ -373,6 +375,18 @@ class BrokerServer(
       // Create and initialize an authorizer if one is configured.
       authorizerPlugin = config.createNewAuthorizer(metrics, ProcessRole.BrokerRole.toString)
 
+      // Load, configure, and start RecordFetchPlugin instances.
+      val pluginClassNames = config.getList(ServerConfigs.RECORD_FETCH_PLUGIN_CLASSES_CONFIG)
+      if (pluginClassNames != null && !pluginClassNames.isEmpty) {
+        pluginClassNames.forEach { className =>
+          val plugin = Utils.newInstance(className, classOf[RecordFetchPlugin])
+          plugin.configure(config.originals)
+          plugin.start(authorizerPlugin.map(_.get).orNull)
+          recordFetchPlugins.add(plugin)
+          info(s"Loaded and started RecordFetchPlugin: $className")
+        }
+      }
+
       /* initializing the groupConfigManager */
       groupConfigManager = new GroupConfigManager(config.groupCoordinatorConfig.extractGroupConfigMap(config.shareGroupConfig))
 
@@ -483,7 +497,8 @@ class BrokerServer(
         tokenManager = tokenManager,
         apiVersionManager = apiVersionManager,
         clientMetricsManager = clientMetricsManager,
-        groupConfigManager = groupConfigManager)
+        groupConfigManager = groupConfigManager,
+        recordFetchPlugins = recordFetchPlugins)
 
       dataPlaneRequestHandlerPool = sharedServer.requestHandlerPoolFactory.createPool(
         config.nodeId,
@@ -816,6 +831,12 @@ class BrokerServer(
         Utils.swallow(this.logger.underlying, () => dataPlaneRequestHandlerPool.shutdown())
       if (dataPlaneRequestProcessor != null)
         Utils.swallow(this.logger.underlying, () => dataPlaneRequestProcessor.close())
+
+      // Close RecordFetchPlugin instances.
+      recordFetchPlugins.forEach(plugin =>
+        Utils.closeQuietly(plugin, "record fetch plugin " + plugin.getClass.getName))
+      recordFetchPlugins.clear()
+
       authorizerPlugin.foreach(Utils.closeQuietly(_, "authorizer plugin"))
 
       /**

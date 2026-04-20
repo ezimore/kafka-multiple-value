@@ -674,4 +674,12 @@ For a detailed description of spotbugs bug categories, see https://spotbugs.read
         <Bug pattern="SF_SWITCH_FALLTHROUGH"/>
     </Match>
 
+    <Match>
+        <!-- False positive in Scala — recursive call passes the same parameter through,
+             which SpotBugs bytecode analysis interprets as a local self-assignment. -->
+        <Class name="kafka.server.KafkaApis"/>
+        <Method name="applyRecordFetchPlugins"/>
+        <Bug pattern="SA_LOCAL_SELF_ASSIGNMENT"/>
+    </Match>
+
 </FindBugsFilter>

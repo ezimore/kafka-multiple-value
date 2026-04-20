@@ -40,8 +40,11 @@ import org.apache.kafka.server.ApiVersionManager;
 import org.apache.kafka.server.ClientMetricsManager;
 import org.apache.kafka.server.FetchManager;
 import org.apache.kafka.server.authorizer.Authorizer;
+import org.apache.kafka.server.record.RecordFetchPlugin;
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats;
 
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -71,6 +74,7 @@ public class KafkaApisBuilder {
     private ClientMetricsManager clientMetricsManager = null;
     private ShareCoordinator shareCoordinator = null;
     private GroupConfigManager groupConfigManager = null;
+    private List<RecordFetchPlugin> recordFetchPlugins = Collections.emptyList();
 
     public KafkaApisBuilder setRequestChannel(RequestChannel requestChannel) {
         this.requestChannel = requestChannel;
@@ -187,6 +191,11 @@ public class KafkaApisBuilder {
         return this;
     }
 
+    public KafkaApisBuilder setRecordFetchPlugins(List<RecordFetchPlugin> recordFetchPlugins) {
+        this.recordFetchPlugins = recordFetchPlugins;
+        return this;
+    }
+
     @SuppressWarnings({"CyclomaticComplexity"})
     public KafkaApis build() {
         if (requestChannel == null) throw new RuntimeException("you must set requestChannel");
@@ -230,6 +239,7 @@ public class KafkaApisBuilder {
                              tokenManager,
                              apiVersionManager,
                              clientMetricsManager,
-                             groupConfigManager);
+                             groupConfigManager,
+                             recordFetchPlugins);
     }
 }

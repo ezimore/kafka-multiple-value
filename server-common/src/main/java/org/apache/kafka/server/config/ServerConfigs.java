@@ -22,6 +22,7 @@ import org.apache.kafka.common.config.TopicConfig;
 import org.apache.kafka.common.record.internal.CompressionType;
 import org.apache.kafka.server.authorizer.Authorizer;
 import org.apache.kafka.server.record.BrokerCompressionType;
+import org.apache.kafka.server.record.RecordFetchPlugin;
 
 import java.util.List;
 
@@ -125,6 +126,14 @@ public class ServerConfigs {
             "initialization. This is useful when the authorizer is dependent on the cluster itself for bootstrapping, as is the case for " +
             "the StandardAuthorizer (which stores ACLs in the metadata log.) By default, all listeners included in controller.listener.names " +
             "will also be early start listeners. A listener should not appear in this list if it accepts external traffic.";
+
+    /************* Record Fetch Plugin Configuration ***********/
+    public static final String RECORD_FETCH_PLUGIN_CLASSES_CONFIG = "record.fetch.plugin.classes";
+    public static final List<String> RECORD_FETCH_PLUGIN_CLASSES_DEFAULT = List.of();
+    public static final String RECORD_FETCH_PLUGIN_CLASSES_DOC = "A comma-separated list of <code>" +
+            RecordFetchPlugin.class.getName() + "</code> implementation class names to load at broker startup. " +
+            "These plugins can inspect, transform, or filter individual records during fetch response construction. " +
+            "If empty, no per-record plugin processing occurs during fetch.";
     public static final ConfigDef CONFIG_DEF =  new ConfigDef()
             .define(BROKER_ID_CONFIG, INT, BROKER_ID_DEFAULT, HIGH, BROKER_ID_DOC)
             .define(MESSAGE_MAX_BYTES_CONFIG, INT, ServerLogConfigs.MAX_MESSAGE_BYTES_DEFAULT, atLeast(0), HIGH, MESSAGE_MAX_BYTES_DOC)
@@ -138,6 +147,8 @@ public class ServerConfigs {
             /************* Authorizer Configuration ***********/
             .define(AUTHORIZER_CLASS_NAME_CONFIG, STRING, AUTHORIZER_CLASS_NAME_DEFAULT, new ConfigDef.NonNullValidator(), LOW, AUTHORIZER_CLASS_NAME_DOC)
             .define(EARLY_START_LISTENERS_CONFIG, LIST, null, ConfigDef.ValidList.anyNonDuplicateValues(true, true), HIGH, EARLY_START_LISTENERS_DOC)
+            /************* Record Fetch Plugin Configuration ***********/
+            .define(RECORD_FETCH_PLUGIN_CLASSES_CONFIG, LIST, RECORD_FETCH_PLUGIN_CLASSES_DEFAULT, ConfigDef.ValidList.anyNonDuplicateValues(true, false), LOW, RECORD_FETCH_PLUGIN_CLASSES_DOC)
             /************ Rack Configuration ******************/
             .define(BROKER_RACK_CONFIG, STRING, null, MEDIUM, BROKER_RACK_DOC)
             /** ********* Controlled shutdown configuration ***********/

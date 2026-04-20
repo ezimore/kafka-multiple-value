@@ -138,6 +138,11 @@
         <allow pkg="org.jose4j" />
         <allow pkg="javax.crypto"/>
       </subpackage>
+      <subpackage name="mla">
+        <allow pkg="org.apache.kafka.clients.consumer" />
+        <allow pkg="org.apache.kafka.common.record" />
+        <allow pkg="org.apache.kafka.common.header" />
+      </subpackage>
     </subpackage>
 
     <subpackage name="protocol">

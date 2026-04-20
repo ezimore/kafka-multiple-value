@@ -2051,6 +2051,12 @@ project(':clients') {
     include "**/org/apache/kafka/server/quota/*"
     include "**/org/apache/kafka/server/telemetry/*"
   }
+
+  test {
+    useJUnitPlatform {
+      includeEngines 'jqwik', 'junit-jupiter'
+    }
+  }
 }
 
 project(':clients:clients-integration-tests') {
@@ -2208,10 +2214,17 @@ project(':server-common') {
     testImplementation project(':clients').sourceSets.test.output
     testImplementation libs.jacksonDataformatYaml
     testImplementation libs.junitJupiter
+    testImplementation libs.jqwik
     testImplementation libs.mockitoCore
     testImplementation testLog4j2Libs
 
     testRuntimeOnly runtimeTestLibs
+  }
+
+  test {
+    useJUnitPlatform {
+      includeEngines 'jqwik', 'junit-jupiter'
+    }
   }
 
   task createVersionFile() {

@@ -222,6 +222,12 @@ public class TopicConfig {
         "configuration. If message.timestamp.type=CreateTime, the message will be rejected if the difference in " +
         "timestamps exceeds this specified threshold. This configuration is ignored if message.timestamp.type=LogAppendTime.";
 
+    public static final String RECORD_FETCH_PLUGINS_CONFIG = "record.fetch.plugins";
+    public static final String RECORD_FETCH_PLUGINS_DOC =
+        "A comma-separated list of RecordFetchPlugin class names that are active for this topic. "
+        + "Each class must be loaded at the broker via the broker-level record.fetch.plugin.classes "
+        + "configuration. If empty, no per-record plugin processing occurs during fetch.";
+
     /**
      * @deprecated down-conversion is not possible in Apache Kafka 4.0 and newer, hence this configuration is a no-op,
      *             and it is deprecated for removal in Apache Kafka 5.0.
