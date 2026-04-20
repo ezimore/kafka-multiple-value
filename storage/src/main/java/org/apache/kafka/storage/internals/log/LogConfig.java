@@ -248,6 +248,8 @@ public class LogConfig extends AbstractConfig {
                         TopicConfig.LOCAL_LOG_RETENTION_BYTES_DOC)
                 .define(TopicConfig.REMOTE_LOG_COPY_DISABLE_CONFIG, BOOLEAN, false, MEDIUM, TopicConfig.REMOTE_LOG_COPY_DISABLE_DOC)
                 .define(TopicConfig.REMOTE_LOG_DELETE_ON_DISABLE_CONFIG, BOOLEAN, false, MEDIUM, TopicConfig.REMOTE_LOG_DELETE_ON_DISABLE_DOC)
+                .define(TopicConfig.RECORD_FETCH_PLUGINS_CONFIG, LIST, List.of(),
+                        ConfigDef.ValidList.anyNonDuplicateValues(true, false), LOW, TopicConfig.RECORD_FETCH_PLUGINS_DOC)
                 .defineInternal(INTERNAL_SEGMENT_BYTES_CONFIG, INT, null, null, MEDIUM, INTERNAL_SEGMENT_BYTES_DOC);
     }
 
@@ -290,6 +292,7 @@ public class LogConfig extends AbstractConfig {
     private final RemoteLogConfig remoteLogConfig;
     private final int maxMessageSize;
     private final Map<?, ?> props;
+    public final List<String> recordFetchPlugins;
 
     public LogConfig(Map<?, ?> props) {
         this(props, Set.of());
@@ -337,6 +340,7 @@ public class LogConfig extends AbstractConfig {
         this.followerReplicationThrottledReplicas = Collections.unmodifiableList(getList(QuotaConfig.FOLLOWER_REPLICATION_THROTTLED_REPLICAS_CONFIG));
 
         remoteLogConfig = new RemoteLogConfig(this);
+        this.recordFetchPlugins = Collections.unmodifiableList(getList(TopicConfig.RECORD_FETCH_PLUGINS_CONFIG));
     }
 
     private Optional<Compression> getCompression() {
@@ -602,6 +606,32 @@ public class LogConfig extends AbstractConfig {
     }
 
     /**
+     * Validates that all plugin class names specified in the topic's {@code record.fetch.plugins}
+     * configuration are loaded at the broker level via {@code record.fetch.plugin.classes}.
+     *
+     * @param topicRecordFetchPlugins the list of plugin class names from the topic config
+     * @param brokerLoadedPluginClassNames the set of plugin class names loaded at the broker
+     * @throws InvalidConfigurationException if any referenced plugin class is not loaded at the broker
+     */
+    public static void validateRecordFetchPlugins(List<String> topicRecordFetchPlugins,
+                                                  Set<String> brokerLoadedPluginClassNames) {
+        if (topicRecordFetchPlugins == null || topicRecordFetchPlugins.isEmpty()) {
+            return;
+        }
+        for (String pluginClassName : topicRecordFetchPlugins) {
+            String trimmed = pluginClassName.trim();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+            if (!brokerLoadedPluginClassNames.contains(trimmed)) {
+                throw new InvalidConfigurationException(
+                    "RecordFetchPlugin class '" + trimmed + "' is not loaded at the broker. "
+                    + "Ensure the class is included in the broker-level 'record.fetch.plugin.classes' configuration.");
+            }
+        }
+    }
+
+    /**
      * Check that the given properties contain only valid log config names and that all values can be parsed and are valid
      */
     public static void validate(Properties props) {
@@ -652,6 +682,7 @@ public class LogConfig extends AbstractConfig {
                 ", followerReplicationThrottledReplicas=" + followerReplicationThrottledReplicas +
                 ", remoteLogConfig=" + remoteLogConfig +
                 ", maxMessageSize=" + maxMessageSize +
+                ", recordFetchPlugins=" + recordFetchPlugins +
                 '}';
     }
 
