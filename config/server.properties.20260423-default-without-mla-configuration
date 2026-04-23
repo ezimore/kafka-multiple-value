@@ -34,14 +34,14 @@ controller.quorum.bootstrap.servers=localhost:9093
 #     listeners = listener_name://host_name:port
 #   EXAMPLE:
 #     listeners = PLAINTEXT://your.host.name:9092
-#listeners=PLAINTEXT://:9092,CONTROLLER://:9093
+listeners=PLAINTEXT://:9092,CONTROLLER://:9093
 
 # Name of listener used for communication between brokers.
 inter.broker.listener.name=PLAINTEXT
 
 # Listener name, hostname and port the broker or the controller will advertise to clients.
 # If not set, it uses the value for "listeners".
-#advertised.listeners=PLAINTEXT://localhost:9092,CONTROLLER://localhost:9093
+advertised.listeners=PLAINTEXT://localhost:9092,CONTROLLER://localhost:9093
 
 # A comma-separated list of the names of the listeners used by the controller.
 # If no explicit mapping set in `listener.security.protocol.map`, default will be using PLAINTEXT protocol
@@ -49,7 +49,7 @@ inter.broker.listener.name=PLAINTEXT
 controller.listener.names=CONTROLLER
 
 # Maps listener names to security protocols, the default is for them to be the same. See the config documentation for more details
-#listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,SSL:SSL,SASL_PLAINTEXT:SASL_PLAINTEXT,SASL_SSL:SASL_SSL
+listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,SSL:SSL,SASL_PLAINTEXT:SASL_PLAINTEXT,SASL_SSL:SASL_SSL
 
 # The number of threads that the server uses for receiving requests from the network and sending responses to the network
 num.network.threads=3
@@ -127,30 +127,3 @@ log.segment.bytes=1073741824
 # The interval at which log segments are checked to see if they can be deleted according
 # to the retention policies
 log.retention.check.interval.ms=300000
-
-# Load the MLA plugin at broker startup
-record.fetch.plugin.classes=org.apache.kafka.server.record.mla.MLAPlugin
-
-# MLA plugin configuration
-mla.strip.authorization.header=true
-mla.consumer.id.registry.topic=_consumer_id_registry
-
-# do not create mla topic automatically
-auto.create.topics.enable=false
-
-# SASL/PLAIN listener
-listeners=PLAINTEXT://:9092,CONTROLLER://:9093,SASL_PLAINTEXT://:9094
-advertised.listeners=PLAINTEXT://localhost:9092,CONTROLLER://localhost:9093,SASL_PLAINTEXT://localhost:9094
-listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,SASL_PLAINTEXT:SASL_PLAINTEXT
-#security.inter.broker.protocol=PLAINTEXT
-sasl.mechanism.inter.broker.protocol=PLAIN
-sasl.enabled.mechanisms=PLAIN
-listener.name.sasl_plaintext.plain.sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required \
-    username="admin" \
-    password="admin-secret" \
-    user_admin="admin-secret" \
-    user_alice="alice-secret" \
-    user_bob="bob-secret" \
-    user_carol="carol-secret" \
-    user_dave="dave-secret" \
-    user_eve="eve-secret";

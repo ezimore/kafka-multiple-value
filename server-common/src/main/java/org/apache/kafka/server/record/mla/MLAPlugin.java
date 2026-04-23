@@ -92,16 +92,9 @@ public class MLAPlugin implements RecordFetchPlugin {
             registryTopic = CONSUMER_ID_REGISTRY_TOPIC_DEFAULT;
         }
 
-        Object bootstrapObj = configs.get("bootstrap.servers");
-        if (bootstrapObj != null) {
-            if (bootstrapObj instanceof List<?> list) {
-                bootstrapServers = String.join(",", list.stream()
-                        .map(Object::toString)
-                        .toList());
-            } else {
-                bootstrapServers = bootstrapObj.toString();
-            }
-        }
+        // Try explicit bootstrap.servers first, then fall back to
+        // advertised.listeners or listeners (KRaft brokers don't set bootstrap.servers).
+        bootstrapServers = resolveBootstrapServers(configs);
 
         log.info("MLAPlugin configured: stripHeader={}, registryTopic={}", stripHeader, registryTopic);
     }
@@ -110,13 +103,49 @@ public class MLAPlugin implements RecordFetchPlugin {
     public void start(Authorizer authorizer) {
         if (bootstrapServers == null || bootstrapServers.isEmpty()) {
             throw new IllegalStateException(
-                    "Cannot start MLAPlugin: bootstrap.servers not found in broker configuration");
+                    "Cannot start MLAPlugin: bootstrap.servers not found in broker configuration. "
+                    + "Checked: bootstrap.servers, advertised.listeners, listeners");
         }
 
+        // Start the registry client in a background thread so it doesn't block
+        // broker startup. The registry topic may not exist yet at startup time,
+        // and ConsumerIdRegistryClient.start() calls partitionsFor() which blocks
+        // until metadata is available.
         registryClient = new ConsumerIdRegistryClient(bootstrapServers, registryTopic);
-        registryClient.start();
+        Thread registryStartThread = new Thread(() -> {
+            int attempt = 0;
+            while (true) {
+                try {
+                    attempt++;
+                    registryClient.start();
+                    log.info("MLAPlugin registry client connected to topic '{}' (attempt {})",
+                            registryTopic, attempt);
+                    return;
+                } catch (Exception e) {
+                    if (attempt <= 3) {
+                        log.warn("MLAPlugin registry client failed to start (attempt {}), "
+                                + "retrying in 5 seconds: {}", attempt, e.getMessage());
+                    } else {
+                        log.warn("MLAPlugin registry client failed to start (attempt {}), "
+                                + "retrying in 5 seconds. The registry topic '{}' may not exist yet. "
+                                + "Create it with: kafka-topics.sh --create --topic {} --config cleanup.policy=compact",
+                                attempt, registryTopic, registryTopic);
+                    }
+                    try {
+                        Thread.sleep(5000);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        log.info("MLAPlugin registry client startup interrupted");
+                        return;
+                    }
+                }
+            }
+        }, "mla-registry-client-starter");
+        registryStartThread.setDaemon(true);
+        registryStartThread.start();
 
-        log.info("MLAPlugin started with registry topic '{}' and bootstrap servers '{}'",
+        log.info("MLAPlugin started with registry topic '{}' and bootstrap servers '{}' "
+                + "(registry client connecting in background)",
                 registryTopic, bootstrapServers);
     }
 
@@ -186,6 +215,81 @@ public class MLAPlugin implements RecordFetchPlugin {
     }
 
     /**
+     * Resolve bootstrap servers from the broker configuration.
+     * Tries, in order:
+     * <ol>
+     *   <li>{@code bootstrap.servers} (explicit override)</li>
+     *   <li>{@code advertised.listeners} (KRaft / standard broker config)</li>
+     *   <li>{@code listeners} (fallback)</li>
+     * </ol>
+     * For listener strings, only PLAINTEXT and SASL_PLAINTEXT endpoints are used,
+     * and the {@code CONTROLLER://} listener is excluded.
+     */
+    private static String resolveBootstrapServers(Map<String, ?> configs) {
+        // 1. Explicit bootstrap.servers
+        Object bootstrapObj = configs.get("bootstrap.servers");
+        if (bootstrapObj != null) {
+            String val;
+            if (bootstrapObj instanceof List<?> list) {
+                val = String.join(",", list.stream().map(Object::toString).toList());
+            } else {
+                val = bootstrapObj.toString();
+            }
+            if (!val.isBlank()) {
+                return val;
+            }
+        }
+
+        // 2. advertised.listeners
+        String result = extractFromListeners(configs.get("advertised.listeners"));
+        if (result != null) {
+            return result;
+        }
+
+        // 3. listeners
+        return extractFromListeners(configs.get("listeners"));
+    }
+
+    /**
+     * Extract host:port pairs from a Kafka listener string, filtering out
+     * CONTROLLER listeners and stripping the protocol prefix.
+     * Example input: {@code PLAINTEXT://:9092,CONTROLLER://:9093}
+     * Example output: {@code localhost:9092}
+     */
+    private static String extractFromListeners(Object listenersObj) {
+        if (listenersObj == null) {
+            return null;
+        }
+        String listeners = listenersObj.toString();
+        if (listeners.isBlank()) {
+            return null;
+        }
+
+        StringBuilder sb = new StringBuilder();
+        for (String part : listeners.split(",")) {
+            String trimmed = part.trim();
+            // Skip controller listeners
+            if (trimmed.toUpperCase().startsWith("CONTROLLER")) {
+                continue;
+            }
+            // Strip protocol prefix: "PLAINTEXT://host:port" -> "host:port"
+            int slashSlash = trimmed.indexOf("://");
+            String hostPort = (slashSlash >= 0) ? trimmed.substring(slashSlash + 3) : trimmed;
+            // Replace empty host (e.g., ":9092") with localhost
+            if (hostPort.startsWith(":")) {
+                hostPort = "localhost" + hostPort;
+            }
+            if (!hostPort.isBlank()) {
+                if (sb.length() > 0) {
+                    sb.append(",");
+                }
+                sb.append(hostPort);
+            }
+        }
+        return sb.length() > 0 ? sb.toString() : null;
+    }
+
+    /**
      * Get or create a bitmask for the given principal. Looks up the consumer ID
      * from the registry client and generates the bitmask using
      * {@link AuthorizationBitmap#createBitmask(int)}.
@@ -194,10 +298,15 @@ public class MLAPlugin implements RecordFetchPlugin {
      * @return the consumer bitmask, or null if the principal is not in the registry
      */
     private byte[] getOrCreateBitmask(String principalName) {
+        // Registry client may not be connected yet (background startup)
+        ConsumerIdRegistryClient client = registryClient;
+        if (client == null || client.getConsumerId(principalName) == null) {
+            bitmaskCache.remove(principalName);
+            return null;
+        }
+
         // Always check the registry client first to handle deletions.
-        // If the principal has been removed (tombstone), the registry returns null
-        // and we must invalidate any cached bitmask.
-        Integer consumerId = registryClient.getConsumerId(principalName);
+        Integer consumerId = client.getConsumerId(principalName);
         if (consumerId == null) {
             bitmaskCache.remove(principalName);
             return null;

@@ -165,9 +165,13 @@ class KafkaApis(val requestChannel: RequestChannel,
 
         val bufferSupplier = BufferSupplier.create()
         try {
-          // Estimate output buffer size as same as input (may be smaller after filtering)
-          val outputBuffer = ByteBuffer.allocate(memoryRecords.sizeInBytes())
+          // Estimate output buffer size as same as input plus room for one empty batch header
+          val outputBuffer = ByteBuffer.allocate(memoryRecords.sizeInBytes() + DefaultRecordBatch.RECORD_BATCH_OVERHEAD)
           var hasFiltered = false
+          // Track the highest offset seen across all batches (for offset advancement)
+          var highestOriginalOffset: Long = -1
+          // Track the highest offset that survived filtering
+          var highestSurvivingOffset: Long = -1
 
           for (batch <- memoryRecords.batches().asScala) {
             val magic = batch.magic()
@@ -175,6 +179,11 @@ class KafkaApis(val requestChannel: RequestChannel,
             val timestampType = batch.timestampType()
             val baseOffset = batch.baseOffset()
             val logAppendTime = if (timestampType == org.apache.kafka.common.record.TimestampType.LOG_APPEND_TIME) batch.maxTimestamp() else RecordBatch.NO_TIMESTAMP
+
+            // Track the highest offset in the original data
+            if (batch.lastOffset() > highestOriginalOffset) {
+              highestOriginalOffset = batch.lastOffset()
+            }
 
             // Collect surviving records for this batch
             val survivingRecords = new java.util.ArrayList[Record]()
@@ -216,6 +225,9 @@ class KafkaApis(val requestChannel: RequestChannel,
                     hasFiltered = true
                   }
                   survivingRecords.add(currentRecord)
+                  if (record.offset() > highestSurvivingOffset) {
+                    highestSurvivingOffset = record.offset()
+                  }
                 }
               }
             } finally {
@@ -242,6 +254,40 @@ class KafkaApis(val requestChannel: RequestChannel,
             // No records were filtered, return original records unchanged
             memoryRecords
           } else {
+            info(s"RecordFetchPlugin: filtered records in $topicPartition for $principal. " +
+              s"highestOriginal=$highestOriginalOffset, highestSurviving=$highestSurvivingOffset, " +
+              s"outputBuffer.position=${outputBuffer.position()}")
+            // If records were filtered from the tail (highestOriginalOffset > highestSurvivingOffset),
+            // append an empty batch header so the consumer advances past the filtered records.
+            // Without this, the consumer would re-fetch the same filtered offsets repeatedly.
+            if (highestOriginalOffset > highestSurvivingOffset && highestOriginalOffset >= 0) {
+              info(s"RecordFetchPlugin: writing advancement batch at offset $highestOriginalOffset " +
+                s"to advance consumer past filtered records (highest surviving=$highestSurvivingOffset) " +
+                s"for $topicPartition principal=$principal")
+              // Write a minimal batch containing a single empty record at the highest
+              // filtered offset. This ensures ALL consumer clients (Java, librdkafka, etc.)
+              // advance their fetch position past the filtered records.
+              // The record carries an "mla-filtered" header so consumers can identify and
+              // skip it if needed.
+              val advancementBuilder = MemoryRecords.builder(
+                outputBuffer,
+                RecordBatch.CURRENT_MAGIC_VALUE,
+                Compression.NONE,
+                org.apache.kafka.common.record.TimestampType.CREATE_TIME,
+                highestOriginalOffset, // baseOffset
+                System.currentTimeMillis()
+              )
+              advancementBuilder.appendWithOffset(
+                highestOriginalOffset,  // offset
+                System.currentTimeMillis(), // timestamp
+                null.asInstanceOf[Array[Byte]], // key
+                null.asInstanceOf[Array[Byte]], // value
+                Array(new org.apache.kafka.common.header.internals.RecordHeader(
+                  "record-fetch-plugin-filtered", "true".getBytes(java.nio.charset.StandardCharsets.UTF_8)
+                ).asInstanceOf[org.apache.kafka.common.header.Header])
+              )
+              advancementBuilder.close()
+            }
             outputBuffer.flip()
             MemoryRecords.readableRecords(outputBuffer)
           }
