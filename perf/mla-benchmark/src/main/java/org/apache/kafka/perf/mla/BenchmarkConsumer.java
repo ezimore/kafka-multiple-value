@@ -39,6 +39,7 @@ import java.util.UUID;
  * Usage:
  *   java BenchmarkConsumer <option> <consumerId> <bootstrap> <topics>
  *                          <filterEventIds> <timeoutSec> <reportIntervalMs>
+ *                          [saslUser saslPassword]
  *
  * Options:
  *   1 = client-side filtering (subscribe to topic, filter by event-id header)
@@ -49,15 +50,17 @@ import java.util.UUID;
  * topics: comma-separated topic list to subscribe to
  * filterEventIds: comma-separated event IDs to accept (option 1 only, ignored for 2/3)
  * timeoutSec: stop after this many seconds of no new records
+ * saslUser/saslPassword: optional SASL/PLAIN credentials
  */
 public class BenchmarkConsumer {
 
     private static final String EVENT_ID_HEADER = "event-id";
+    private static final String FILTERED_HEADER = "record-fetch-plugin-filtered";
 
     public static void main(String[] args) throws Exception {
         if (args.length < 7) {
             System.err.println("Usage: BenchmarkConsumer <option> <consumerId> <bootstrap> "
-                + "<topics> <filterEventIds> <timeoutSec> <reportIntervalMs>");
+                + "<topics> <filterEventIds> <timeoutSec> <reportIntervalMs> [saslUser saslPassword]");
             System.exit(1);
         }
 
@@ -68,6 +71,8 @@ public class BenchmarkConsumer {
         String filterStr = args[4];
         int timeoutSec = Integer.parseInt(args[5]);
         long reportIntervalMs = Long.parseLong(args[6]);
+        String saslUser = args.length > 7 ? args[7] : null;
+        String saslPassword = args.length > 8 ? args[8] : null;
 
         // Parse filter event IDs (for option 1)
         Set<String> filterEventIds = new HashSet<>();
@@ -87,11 +92,21 @@ public class BenchmarkConsumer {
         props.put(ConsumerConfig.FETCH_MIN_BYTES_CONFIG, 1024 * 64);  // 64KB min fetch
         props.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 1000);
 
+        // SASL/PLAIN authentication
+        if (saslUser != null && saslPassword != null) {
+            props.put("security.protocol", "SASL_PLAINTEXT");
+            props.put("sasl.mechanism", "PLAIN");
+            props.put("sasl.jaas.config",
+                "org.apache.kafka.common.security.plain.PlainLoginModule required "
+                + "username=\"" + saslUser + "\" password=\"" + saslPassword + "\";");
+        }
+
         String[] topics = topicsStr.split(",");
 
         System.out.printf("=== CONSUMER %d Option %d ===%n", consumerId, option);
-        System.out.printf("Topics: %s, Filter: %s%n", topicsStr,
-            filterEventIds.isEmpty() ? "none (broker-filtered or topic-routed)" : filterEventIds);
+        System.out.printf("Topics: %s, Filter: %s, SASL: %s%n", topicsStr,
+            filterEventIds.isEmpty() ? "none (broker-filtered or topic-routed)" : filterEventIds,
+            saslUser != null ? "User:" + saslUser : "ANONYMOUS");
 
         long totalRecords = 0;
         long totalBytes = 0;
@@ -118,6 +133,12 @@ public class BenchmarkConsumer {
 
                 for (ConsumerRecord<String, byte[]> record : records) {
                     totalRecords++;
+
+                    // Skip broker-injected advancement records (offset tracking for filtered records)
+                    if (hasHeader(record, "record-fetch-plugin-filtered")) {
+                        continue;
+                    }
+
                     int recordSize = (record.value() != null ? record.value().length : 0)
                         + (record.key() != null ? record.key().getBytes(StandardCharsets.UTF_8).length : 0);
 
@@ -187,5 +208,14 @@ public class BenchmarkConsumer {
             }
         }
         return null;
+    }
+
+    private static boolean hasHeader(ConsumerRecord<String, byte[]> record, String headerKey) {
+        for (Header header : record.headers()) {
+            if (headerKey.equals(header.key())) {
+                return true;
+            }
+        }
+        return false;
     }
 }

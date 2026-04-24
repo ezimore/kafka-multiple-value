@@ -27,6 +27,7 @@ RESULTS_DIR="$KAFKA_HOME/$RESULTS_DIR"
 CLASSPATH="$KAFKA_HOME/core/build/libs/*:$KAFKA_HOME/clients/build/libs/*:$KAFKA_HOME/server-common/build/libs/*:$KAFKA_HOME/server/build/libs/*:$KAFKA_HOME/tools/build/libs/*:$KAFKA_HOME/metadata/build/libs/*:$KAFKA_HOME/storage/build/libs/*:$KAFKA_HOME/storage/storage-api/build/libs/*:$KAFKA_HOME/raft/build/libs/*:$KAFKA_HOME/group-coordinator/group-coordinator-api/build/libs/*:$KAFKA_HOME/share-coordinator/build/libs/*:$KAFKA_HOME/transaction-coordinator/build/libs/*:$KAFKA_HOME/coordinator-common/build/libs/*:$KAFKA_HOME/tools/tools-api/build/libs/*"
 PERF_CLASSPATH="$SCRIPT_DIR/build/classes:$CLASSPATH"
 BOOTSTRAP="localhost:$BROKER_PORT"
+SASL_BOOTSTRAP="localhost:$SASL_PORT"
 
 # Colors for output
 RED='\033[0;31m'
@@ -71,7 +72,7 @@ start_broker() {
     cluster_id=$("$KAFKA_HOME/bin/kafka-storage.sh" random-uuid)
 
     # Create broker config
-    cp "$KAFKA_HOME/config/kraft/server.properties" "$config_file"
+    cp "$KAFKA_HOME/config/server.properties" "$config_file"
 
     # Override data directory
     sed -i "s|log.dirs=.*|log.dirs=$DATA_DIR|g" "$config_file"
@@ -83,12 +84,27 @@ start_broker() {
         echo "record.fetch.plugin.classes=org.apache.kafka.server.record.mla.MLAPlugin" >> "$config_file"
         echo "mla.strip.authorization.header=true" >> "$config_file"
         echo "mla.consumer.id.registry.topic=$REGISTRY_TOPIC" >> "$config_file"
+        echo "" >> "$config_file"
+        echo "# SASL/PLAIN listener for authenticated consumers" >> "$config_file"
+        echo "listeners=PLAINTEXT://:${BROKER_PORT},CONTROLLER://:9093,SASL_PLAINTEXT://:${SASL_PORT}" >> "$config_file"
+        echo "advertised.listeners=PLAINTEXT://localhost:${BROKER_PORT},CONTROLLER://localhost:9093,SASL_PLAINTEXT://localhost:${SASL_PORT}" >> "$config_file"
+        echo "listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,SASL_PLAINTEXT:SASL_PLAINTEXT" >> "$config_file"
+        echo "sasl.mechanism.inter.broker.protocol=PLAIN" >> "$config_file"
+        echo "sasl.enabled.mechanisms=PLAIN" >> "$config_file"
+        echo "listener.name.sasl_plaintext.plain.sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required \\" >> "$config_file"
+        echo "    username=\"admin\" \\" >> "$config_file"
+        echo "    password=\"admin-secret\" \\" >> "$config_file"
+        echo "    user_admin=\"admin-secret\" \\" >> "$config_file"
+        echo "    user_${SASL_CONSUMER1_USER}=\"${SASL_CONSUMER1_PASS}\" \\" >> "$config_file"
+        echo "    user_${SASL_CONSUMER2_USER}=\"${SASL_CONSUMER2_PASS}\" \\" >> "$config_file"
+        echo "    user_${SASL_CONSUMER3_USER}=\"${SASL_CONSUMER3_PASS}\";" >> "$config_file"
     fi
 
     # Format storage
     "$KAFKA_HOME/bin/kafka-storage.sh" format \
         --config "$config_file" \
-        --cluster-id "$cluster_id" 2>/dev/null
+        --cluster-id "$cluster_id" \
+        --standalone 2>/dev/null
 
     log "Starting broker (option $option)..."
     export KAFKA_HEAP_OPTS="-Xmx${BROKER_HEAP} -Xms${BROKER_HEAP}"
@@ -134,18 +150,20 @@ create_topics() {
             ;;
         2)
             log "Creating registry topic and events topic (MLA-enabled)"
-            # Registry topic
+            # Registry topic (may already be auto-created by MLAPlugin, recreate with compaction)
             "$KAFKA_HOME/bin/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" \
                 --create --topic "$REGISTRY_TOPIC" --partitions 1 \
                 --replication-factor "$REPLICATION_FACTOR" \
-                --config cleanup.policy=compact 2>/dev/null
+                --config cleanup.policy=compact 2>/dev/null || true
 
-            # Register consumers
+            # Register consumers with real SASL principals
             java -cp "$PERF_CLASSPATH" org.apache.kafka.perf.mla.SetupRegistry \
-                "$BOOTSTRAP" "$REGISTRY_TOPIC"
+                "$BOOTSTRAP" "$REGISTRY_TOPIC" \
+                "User:${SASL_CONSUMER1_USER}" "User:${SASL_CONSUMER2_USER}" "User:${SASL_CONSUMER3_USER}"
 
-            # Wait for registry to be populated
-            sleep 3
+            # Wait for MLAPlugin's background registry client to pick up registrations
+            log "Waiting for MLAPlugin registry client to sync..."
+            sleep 10
 
             # Events topic with MLA plugin
             "$KAFKA_HOME/bin/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" \
@@ -217,15 +235,31 @@ run_option() {
             consumer_pids+=($!)
             ;;
         2)
-            # Option 2: 3 consumers, broker filters via MLA
-            # All consumers subscribe to "events", broker delivers only authorized records
-            for cid in 1 2 3; do
-                java -Xmx${CONSUMER_HEAP} -cp "$PERF_CLASSPATH" \
-                    org.apache.kafka.perf.mla.BenchmarkConsumer \
-                    2 "$cid" "$BOOTSTRAP" "events" "none" 30 "$REPORT_INTERVAL_MS" \
-                    > "$option_dir/consumer${cid}.log" 2>&1 &
-                consumer_pids+=($!)
-            done
+            # Option 2: 3 consumers with SASL authentication, broker filters via MLA
+            # Each consumer authenticates as a different user so the MLAPlugin can
+            # distinguish them and apply per-consumer bitmap filtering.
+            local sasl_bootstrap="localhost:${SASL_PORT}"
+
+            java -Xmx${CONSUMER_HEAP} -cp "$PERF_CLASSPATH" \
+                org.apache.kafka.perf.mla.BenchmarkConsumer \
+                2 1 "$sasl_bootstrap" "events" "none" 60 "$REPORT_INTERVAL_MS" \
+                "$SASL_CONSUMER1_USER" "$SASL_CONSUMER1_PASS" \
+                > "$option_dir/consumer1.log" 2>&1 &
+            consumer_pids+=($!)
+
+            java -Xmx${CONSUMER_HEAP} -cp "$PERF_CLASSPATH" \
+                org.apache.kafka.perf.mla.BenchmarkConsumer \
+                2 2 "$sasl_bootstrap" "events" "none" 60 "$REPORT_INTERVAL_MS" \
+                "$SASL_CONSUMER2_USER" "$SASL_CONSUMER2_PASS" \
+                > "$option_dir/consumer2.log" 2>&1 &
+            consumer_pids+=($!)
+
+            java -Xmx${CONSUMER_HEAP} -cp "$PERF_CLASSPATH" \
+                org.apache.kafka.perf.mla.BenchmarkConsumer \
+                2 3 "$sasl_bootstrap" "events" "none" 60 "$REPORT_INTERVAL_MS" \
+                "$SASL_CONSUMER3_USER" "$SASL_CONSUMER3_PASS" \
+                > "$option_dir/consumer3.log" 2>&1 &
+            consumer_pids+=($!)
             ;;
         3)
             # Option 3: 3 consumers, each on its own topic

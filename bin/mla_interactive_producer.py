@@ -106,7 +106,7 @@ def print_help():
     """Print interactive commands."""
     print()
     print("  Commands:")
-    print("    <message text>          — then you'll be asked for authorized consumers")
+    print("    <message text>          — then you'll be asked for authorized consumers and count")
     print("    list                    — show registered consumers again")
     print("    reload                  — re-read the registry topic")
     print("    help                    — show this help")
@@ -124,13 +124,10 @@ def interactive_loop(producer, topic, mappings, bootstrap, registry_topic):
 
     while True:
         try:
-            text = input("  Message text (or command): ").strip()
+            text = input("  Message text [Hi]: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n  Bye.")
             break
-
-        if not text:
-            continue
 
         if text.lower() in ("quit", "exit", "q"):
             print("  Bye.")
@@ -149,6 +146,9 @@ def interactive_loop(producer, topic, mappings, bootstrap, registry_topic):
             id_to_principal = {v: k for k, v in mappings.items()}
             print_registry(mappings)
             continue
+
+        if not text:
+            text = "Hi"
 
         # Ask for authorized consumers
         print()
@@ -191,32 +191,48 @@ def interactive_loop(producer, topic, mappings, bootstrap, registry_topic):
         print(f"  Bitmap bits: {bit_str}")
         print(f"  Authorized:  {', '.join(authorized_names) if authorized_names else '(nobody)'}")
 
-        # Produce
-        msg_counter += 1
-        key = f"msg-{msg_counter}"
-        headers = {"mla-authz-bitmap": bitmap} if bitmap else {}
+        # Ask how many copies to send
+        try:
+            count_str = input("  How many messages to send? [1]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Bye.")
+            break
 
-        producer.produce(
-            topic,
-            key=key.encode("utf-8"),
-            value=text.encode("utf-8"),
-            headers=headers,
-        )
-        producer.produce(
-            topic,
-            key=key.encode("utf-8"),
-            value=text.encode("utf-8"),
-            headers=headers,
-        )
-        producer.produce(
-            topic,
-            key=key.encode("utf-8"),
-            value=text.encode("utf-8"),
-            headers=headers,
-        )
+        count = 1
+        if count_str:
+            try:
+                count = int(count_str)
+                if count < 1:
+                    count = 1
+            except ValueError:
+                print("  Invalid number, sending 1.")
+                count = 1
+
+        # Produce
+        headers = {"mla-authz-bitmap": bitmap} if bitmap else {}
+        auth_suffix = ", ".join(authorized_names) if authorized_names else "nobody"
+
+        for n in range(count):
+            msg_counter += 1
+            key = f"msg-{msg_counter}"
+            if count == 1:
+                value = f"{text} [{auth_suffix}]"
+            else:
+                value = f"{text} [{n+1}/{count}] [{auth_suffix}]"
+
+            producer.produce(
+                topic,
+                key=key.encode("utf-8"),
+                value=value.encode("utf-8"),
+                headers=headers,
+            )
+
         producer.flush()
 
-        print(f"  Sent '{key}': \"{text}\"")
+        if count == 1:
+            print(f"  Sent 'msg-{msg_counter}': \"{value}\"")
+        else:
+            print(f"  Sent {count} messages (msg-{msg_counter - count + 1} to msg-{msg_counter}): \"{text} [1..{count}] [{auth_suffix}]\"")
         print()
 
 

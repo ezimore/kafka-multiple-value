@@ -36,23 +36,28 @@ import java.util.Properties;
  * Sets up the Consumer ID Registry topic and registers consumers for MLA benchmarks.
  *
  * Usage:
- *   java SetupRegistry <bootstrap> <registryTopic>
+ *   java SetupRegistry <bootstrap> <registryTopic> [consumer1Principal consumer2Principal consumer3Principal]
  *
- * Registers 3 consumers:
- *   User:ANONYMOUS -> ID 0 (consumer1)
- *   User:consumer2 -> ID 1 (consumer2)
- *   User:consumer3 -> ID 2 (consumer3)
+ * Default principals (SASL mode):
+ *   User:alice    -> ID 0 (consumer1)
+ *   User:bob      -> ID 1 (consumer2)
+ *   User:carol    -> ID 2 (consumer3)
  */
 public class SetupRegistry {
 
     public static void main(String[] args) throws Exception {
         if (args.length < 2) {
-            System.err.println("Usage: SetupRegistry <bootstrap> <registryTopic>");
+            System.err.println("Usage: SetupRegistry <bootstrap> <registryTopic> [principal1 principal2 principal3]");
             System.exit(1);
         }
 
         String bootstrap = args[0];
         String registryTopic = args[1];
+
+        // Consumer principals — use args if provided, otherwise defaults
+        String principal1 = args.length > 2 ? args[2] : "User:alice";
+        String principal2 = args.length > 3 ? args[3] : "User:bob";
+        String principal3 = args.length > 4 ? args[4] : "User:carol";
 
         // Create the registry topic
         Properties adminProps = new Properties();
@@ -84,13 +89,10 @@ public class SetupRegistry {
         producerProps.put(ProducerConfig.ACKS_CONFIG, "all");
 
         try (KafkaProducer<String, byte[]> producer = new KafkaProducer<>(producerProps)) {
-            // In PLAINTEXT mode, all consumers are User:ANONYMOUS.
-            // For the benchmark, we register User:ANONYMOUS as consumer1 (ID 0).
-            // consumer2 and consumer3 are registered with their own principals.
             String[][] consumers = {
-                {"User:ANONYMOUS", "0"},  // consumer1
-                {"User:consumer2", "1"},  // consumer2
-                {"User:consumer3", "2"},  // consumer3
+                {principal1, "0"},  // consumer1
+                {principal2, "1"},  // consumer2
+                {principal3, "2"},  // consumer3
             };
 
             for (String[] entry : consumers) {
