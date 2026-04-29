@@ -1,4 +1,77 @@
-# Message-Level Authorization (MLA) — Manual Testing Guide
+# Notes
+
+*Empty record structure:*
+
+Key: null
+Value: null
+Header: record-fetch-plugin-filtered: "true"
+Offset: the highest filtered offset (e.g., 9)
+Timestamp: current time
+ 
+# Message-Level Authorization (MLA) — restart the test
+
+## 1. Build Kafka - clean the previous builds and rebuild everything
+```bash 
+./gradlew clean jar -x test -x spotbugsMain -x checkstyleMain
+```
+
+## 2. Start the Broker
+
+```bash
+./bin/kafka-server-start.sh config/server.properties
+```
+
+## 3. Produce multiple test message
+
+```bash
+source ~/kafka-venv/bin/activate
+python3 bin/mla_produce_test_records.py
+```
+
+## 4. Produce message interactively
+
+```bash
+source ~/kafka-venv/bin/activate
+python3 bin/mla_interactive_producer.py
+```
+
+Commands:
+    <message text>          — then you'll be asked for authorized consumers
+    list                    — show registered consumers again
+    reload                  — re-read the registry topic
+    help                    — show this help
+    quit / exit             — exit the producer
+
+Users
+    ("User:alice", 0),
+    ("User:bob",   1),
+    ("User:carol", 2),
+    ("User:dave",  3),
+    ("User:eve",   4),
+
+## 5. Consume message
+
+```bash
+source ~/kafka-venv/bin/activate
+python3 bin/mla_consumer.py --topic mla-demo --sasl-bootstrap localhost:9094 --user alice --password alice-secret
+python3 bin/mla_consumer.py --topic mla-demo --sasl-bootstrap localhost:9094 --user bob --password bob-secret 
+python3 bin/mla_consumer.py --topic mla-demo --sasl-bootstrap localhost:9094 --user carol --password carol-secret
+python3 bin/mla_consumer.py --topic mla-demo --sasl-bootstrap localhost:9094 --user dave --password dave-secret
+python3 bin/mla_consumer.py --topic mla-demo --sasl-bootstrap localhost:9094 --user eve --password eve-secret
+```
+
+
+-------------------------------------------------------------------------------------------------------------
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+-------------------------------------------------------------------------------------------------------------
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+-------------------------------------------------------------------------------------------------------------
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+-------------------------------------------------------------------------------------------------------------
+
+
+
+# Message-Level Authorization (MLA) — Manual Testing 1st time guide
 
 This guide walks through setting up and manually testing the MLA feature end-to-end on a local Kafka cluster.
 
@@ -190,12 +263,18 @@ You should see 5 records with the principal names as keys.
 ./bin/kafka-topics.sh --bootstrap-server localhost:9092 \
   --create \
   --topic mla-demo \
-  --partitions 1 \
+  --partitions 3 \
   --replication-factor 1 \
   --config record.fetch.plugins=org.apache.kafka.server.record.mla.MLAPlugin
 ```
 
 The `record.fetch.plugins` topic-level config tells the broker which plugins are active for this topic.
+
+### Delete the topic if already there
+```bash
+./bin/kafka-topics.sh --bootstrap-server localhost:9092 --delete --topic _consumer_id_registry
+```
+
 
 ## 8. Produce Records with Authorization Bitmaps
 
@@ -282,6 +361,7 @@ print("\nAll records produced.")
 Run it:
 
 ```bash
+source ~/kafka-venv/bin/activate
 python3 bin/mla_produce_test_records.py
 ```
 
@@ -319,7 +399,13 @@ listener.name.sasl_plaintext.plain.sasl.jaas.config=org.apache.kafka.common.secu
 ./bin/kafka-server-start.sh config/server.properties
 ```
 
-### 3. Create client JAAS configs
+### 3a Consume messages
+
+```bash
+python3 bin/mla_consumer.py --topic mla-demo --sasl-bootstrap localhost:9094 --user alice --password alice-secret
+```
+
+### 3b. Create client JAAS configs
 
 For each user, create a properties file. Example for alice — `config/client-alice.properties`:
 
@@ -333,52 +419,56 @@ sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule require
 
 Create similar files for bob, carol, dave, eve.
 
-### 4. Register consumers with SASL principals
-
-When using SASL/PLAIN, the principal format is `User:alice` (not `User:ANONYMOUS`). The registrations in step 6 already use this format.
-
-#### 6. Consume as each user
+### 4. Consume as each user
 
 Open separate terminals for each consumer:
 
+**Terminal — Anonymous, not registered user:**
+```bash
+./bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic mla-demo \
+  --from-beginning
+```
+
+
 **Terminal — alice (consumer ID 0):**
 ```bash
-./bin/kafka-console-consumer.sh --bootstrap-server localhost:9093 \
+./bin/kafka-console-consumer.sh --bootstrap-server localhost:9094 \
   --topic mla-demo \
   --from-beginning \
-  --consumer.config config/client-alice.properties
+  --consumer.config config/mla_client_alice.properties
 ```
 
 **Terminal — bob (consumer ID 1):**
 ```bash
-./bin/kafka-console-consumer.sh --bootstrap-server localhost:9093 \
+./bin/kafka-console-consumer.sh --bootstrap-server localhost:9094 \
   --topic mla-demo \
   --from-beginning \
-  --consumer.config config/client-bob.properties
+  --consumer.config config/mla_client_bob.properties
 ```
 
 **Terminal — carol (consumer ID 2):**
 ```bash
-./bin/kafka-console-consumer.sh --bootstrap-server localhost:9093 \
+./bin/kafka-console-consumer.sh --bootstrap-server localhost:9094 \
   --topic mla-demo \
   --from-beginning \
-  --consumer.config config/client-carol.properties
+  --consumer.config config/mla_client_carol.properties
 ```
 
 **Terminal — dave (consumer ID 3):**
 ```bash
-./bin/kafka-console-consumer.sh --bootstrap-server localhost:9093 \
+./bin/kafka-console-consumer.sh --bootstrap-server localhost:9094 \
   --topic mla-demo \
   --from-beginning \
-  --consumer.config config/client-dave.properties
+  --consumer.config config/mla_client_dave.properties
 ```
 
 **Terminal — eve (consumer ID 4):**
 ```bash
-./bin/kafka-console-consumer.sh --bootstrap-server localhost:9093 \
+./bin/kafka-console-consumer.sh --bootstrap-server localhost:9094 \
   --topic mla-demo \
   --from-beginning \
-  --consumer.config config/client-eve.properties
+  --consumer.config config/mla_client_eve.properties
 ```
 
 ## 10. Expected Results
@@ -481,3 +571,25 @@ Produce and consume normally — all consumers receive all records, no filtering
   ```
 - **Plugin not loading**: Check broker logs for `MLAPlugin configured` and `MLAPlugin started` messages. Verify `record.fetch.plugin.classes` is set in broker config.
 - **Registry not updating**: The MLAPlugin's internal consumer polls every 500ms. Allow a few seconds after writing to the registry topic.
+
+
+# interactive script
+
+```bash
+source ~/kafka-venv/bin/activate
+python3 bin/mla_interactive_producer.py
+```
+
+Or with custom settings:
+
+```bash
+python3 bin/mla_interactive_producer.py --bootstrap localhost:9092 --topic mla-demo --registry _consumer_id_registry
+```
+
+It will:
+
+Read and display all registered consumers from the registry topic
+Enter an interactive loop where you type a message
+Ask which consumers should receive it (by ID, all, or none)
+Show the bitmap in hex and binary, then produce the record
+Supports list, reload, help, and quit commands

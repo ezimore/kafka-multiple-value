@@ -104,11 +104,11 @@ public class ConsumerIdRegistryClient implements Closeable {
         // Manually assign all partitions and seek to beginning
         List<PartitionInfo> partitionInfos = consumer.partitionsFor(registryTopic);
         if (partitionInfos == null || partitionInfos.isEmpty()) {
-            log.warn("No partitions found for registry topic '{}'. Cache will remain empty until partitions are available.", registryTopic);
+            log.warn("No partitions found for registry topic '{}'. Will retry.", registryTopic);
             consumer.close();
             consumer = null;
             running.set(false);
-            return;
+            throw new IllegalStateException("No partitions found for registry topic '" + registryTopic + "'");
         }
 
         List<TopicPartition> partitions = partitionInfos.stream()
@@ -183,6 +183,7 @@ public class ConsumerIdRegistryClient implements Closeable {
      * and updates the in-memory cache.
      */
     private void pollLoop() {
+        log.info("Registry polling loop started for topic '{}'", registryTopic);
         try {
             while (running.get()) {
                 try {
@@ -197,7 +198,7 @@ public class ConsumerIdRegistryClient implements Closeable {
                 }
             }
         } finally {
-            log.debug("Polling loop exited for registry topic '{}'", registryTopic);
+            log.info("Polling loop exited for registry topic '{}'", registryTopic);
         }
     }
 
@@ -230,7 +231,7 @@ public class ConsumerIdRegistryClient implements Closeable {
         } else {
             int consumerId = ByteBuffer.wrap(value).getInt();
             cache.put(principal, consumerId);
-            log.debug("Updated cache: principal '{}' → consumer ID {}", principal, consumerId);
+            log.debug("Updated cache: principal '{}' -> consumer ID {}", principal, consumerId);
         }
     }
 }

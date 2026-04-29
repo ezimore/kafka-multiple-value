@@ -20,13 +20,11 @@ import org.apache.kafka.clients.producer.Callback;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
-import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.header.internals.RecordHeader;
 import org.apache.kafka.common.security.mla.AuthorizationBitmap;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -38,52 +36,32 @@ import java.util.SplittableRandom;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Benchmark producer that supports all three routing options.
+ * Benchmark producer that supports all routing options.
  *
  * Usage:
  *   java BenchmarkProducer <option> <bootstrap> <numEvents> <minSize> <maxSize>
  *                          <numEventIds> <batchSize> <lingerMs> <reportIntervalMs>
+ *                          <consumerPercentages>
  *
  * Options:
  *   1 = client-side filtering (single topic, event-id header)
- *   2 = MLA broker-side filtering (single topic, event-id header + mla-authz-bitmap)
- *   3 = topic-per-audience (route to event1/event2/event3 topics)
+ *   2 = MLA broker-side filtering (single topic, event-id + mla-authz-bitmap)
+ *   3 = topic-per-audience (route to per-consumer topics)
+ *
+ * consumerPercentages: comma-separated list like "1,5,10,15,20,30,50,70,90,100"
+ *   Each value is the percentage of events that consumer N receives.
+ *   Consumer N receives events with event-id 1..ceil(pct/100*numEventIds).
  */
 public class BenchmarkProducer {
-
-    // MLA authorization mapping: event-id -> set of authorized consumer IDs
-    // event-id 1 -> consumer1 (ID 0), consumer2 (ID 1)
-    // event-id 2 -> consumer2 (ID 1)
-    // event-id 3 -> consumer2 (ID 1), consumer3 (ID 2)
-    // event-id 4 -> consumer3 (ID 2)
-    private static final Map<Integer, Set<Integer>> EVENT_ID_TO_CONSUMER_IDS = new HashMap<>();
-    static {
-        EVENT_ID_TO_CONSUMER_IDS.put(1, new HashSet<>(Arrays.asList(0, 1)));
-        EVENT_ID_TO_CONSUMER_IDS.put(2, new HashSet<>(Arrays.asList(1)));
-        EVENT_ID_TO_CONSUMER_IDS.put(3, new HashSet<>(Arrays.asList(1, 2)));
-        EVENT_ID_TO_CONSUMER_IDS.put(4, new HashSet<>(Arrays.asList(2)));
-    }
-
-    // Topic routing for option 3: event-id -> list of target topics
-    // event-id 1 -> event1, event2
-    // event-id 2 -> event2
-    // event-id 3 -> event2, event3
-    // event-id 4 -> event3
-    private static final Map<Integer, String[]> EVENT_ID_TO_TOPICS = new HashMap<>();
-    static {
-        EVENT_ID_TO_TOPICS.put(1, new String[]{"event1", "event2"});
-        EVENT_ID_TO_TOPICS.put(2, new String[]{"event2"});
-        EVENT_ID_TO_TOPICS.put(3, new String[]{"event2", "event3"});
-        EVENT_ID_TO_TOPICS.put(4, new String[]{"event3"});
-    }
 
     private static final String MLA_AUTHZ_HEADER = "mla-authz-bitmap";
     private static final String EVENT_ID_HEADER = "event-id";
 
     public static void main(String[] args) throws Exception {
-        if (args.length < 9) {
+        if (args.length < 10) {
             System.err.println("Usage: BenchmarkProducer <option> <bootstrap> <numEvents> "
-                + "<minSize> <maxSize> <numEventIds> <batchSize> <lingerMs> <reportIntervalMs>");
+                + "<minSize> <maxSize> <numEventIds> <batchSize> <lingerMs> <reportIntervalMs> "
+                + "<consumerPercentages>");
             System.exit(1);
         }
 
@@ -96,6 +74,47 @@ public class BenchmarkProducer {
         int batchSize = Integer.parseInt(args[6]);
         int lingerMs = Integer.parseInt(args[7]);
         long reportIntervalMs = Long.parseLong(args[8]);
+        String pctStr = args[9];
+
+        // Parse consumer percentages
+        String[] pctParts = pctStr.split(",");
+        int numConsumers = pctParts.length;
+        int[] consumerPcts = new int[numConsumers];
+        for (int i = 0; i < numConsumers; i++) {
+            consumerPcts[i] = Integer.parseInt(pctParts[i].trim());
+        }
+
+        // Build MLA bitmaps: for each event-id, which consumers are authorized?
+        // Consumer N (0-indexed) receives events where event-id <= ceil(pct/100 * numEventIds)
+        Map<Integer, byte[]> bitmapCache = new HashMap<>();
+        if (option == 2) {
+            for (int eid = 1; eid <= numEventIds; eid++) {
+                Set<Integer> authorizedIds = new HashSet<>();
+                for (int c = 0; c < numConsumers; c++) {
+                    int maxEventId = (int) Math.ceil(consumerPcts[c] / 100.0 * numEventIds);
+                    if (eid <= maxEventId) {
+                        authorizedIds.add(c);
+                    }
+                }
+                bitmapCache.put(eid, AuthorizationBitmap.create(authorizedIds));
+            }
+        }
+
+        // Build topic routing for option 3: for each event-id, which consumer topics?
+        // Consumer N's topic is "event-<N+1>"
+        Map<Integer, String[]> topicRouting = new HashMap<>();
+        if (option == 3) {
+            for (int eid = 1; eid <= numEventIds; eid++) {
+                java.util.List<String> targets = new java.util.ArrayList<>();
+                for (int c = 0; c < numConsumers; c++) {
+                    int maxEventId = (int) Math.ceil(consumerPcts[c] / 100.0 * numEventIds);
+                    if (eid <= maxEventId) {
+                        targets.add("event-" + (c + 1));
+                    }
+                }
+                topicRouting.put(eid, targets.toArray(new String[0]));
+            }
+        }
 
         Properties props = new Properties();
         props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap);
@@ -104,15 +123,7 @@ public class BenchmarkProducer {
         props.put(ProducerConfig.ACKS_CONFIG, "1");
         props.put(ProducerConfig.BATCH_SIZE_CONFIG, batchSize);
         props.put(ProducerConfig.LINGER_MS_CONFIG, lingerMs);
-        props.put(ProducerConfig.BUFFER_MEMORY_CONFIG, 128 * 1024 * 1024); // 128MB
-
-        // Pre-compute MLA bitmaps for option 2
-        Map<Integer, byte[]> bitmapCache = new HashMap<>();
-        if (option == 2) {
-            for (Map.Entry<Integer, Set<Integer>> entry : EVENT_ID_TO_CONSUMER_IDS.entrySet()) {
-                bitmapCache.put(entry.getKey(), AuthorizationBitmap.create(entry.getValue()));
-            }
-        }
+        props.put(ProducerConfig.BUFFER_MEMORY_CONFIG, 128 * 1024 * 1024);
 
         SplittableRandom random = new SplittableRandom(42);
         AtomicLong totalSent = new AtomicLong(0);
@@ -121,7 +132,6 @@ public class BenchmarkProducer {
         AtomicLong maxLatency = new AtomicLong(0);
         AtomicLong errors = new AtomicLong(0);
 
-        // Latency sampling (sample 1 in 100 for percentile calculation)
         int sampleSize = (int) Math.min(numEvents / 100 + 1, 500000);
         int[] latencySamples = new int[sampleSize];
         AtomicLong sampleIndex = new AtomicLong(0);
@@ -129,8 +139,9 @@ public class BenchmarkProducer {
         String topicName = (option == 3) ? null : "events";
 
         System.out.printf("=== PRODUCER Option %d ===%n", option);
-        System.out.printf("Events: %d, Size: %d-%d bytes, EventIDs: 1-%d%n",
-            numEvents, minSize, maxSize, numEventIds);
+        System.out.printf("Events: %d, Size: %d-%d bytes, EventIDs: 1-%d, Consumers: %d%n",
+            numEvents, minSize, maxSize, numEventIds, numConsumers);
+        System.out.printf("Consumer percentages: %s%n", pctStr);
 
         long startMs = System.currentTimeMillis();
         long windowStart = startMs;
@@ -139,7 +150,7 @@ public class BenchmarkProducer {
 
         try (KafkaProducer<String, byte[]> producer = new KafkaProducer<>(props)) {
             for (long i = 0; i < numEvents; i++) {
-                int eventId = random.nextInt(numEventIds) + 1; // 1..numEventIds
+                int eventId = random.nextInt(numEventIds) + 1;
                 int payloadSize = minSize + random.nextInt(maxSize - minSize + 1);
                 byte[] payload = new byte[payloadSize];
                 random.nextBytes(payload);
@@ -160,8 +171,6 @@ public class BenchmarkProducer {
                     do {
                         prevMax = maxLatency.get();
                     } while (latency > prevMax && !maxLatency.compareAndSet(prevMax, latency));
-
-                    // Sample latency
                     long idx = sampleIndex.getAndIncrement();
                     if (idx < sampleSize) {
                         latencySamples[(int) idx] = (int) latency;
@@ -169,44 +178,41 @@ public class BenchmarkProducer {
                 };
 
                 switch (option) {
-                    case 1:
-                        // Option 1: single topic, event-id header only
-                        ProducerRecord<String, byte[]> rec1 = new ProducerRecord<>(topicName, null, payload);
-                        rec1.headers().add(new RecordHeader(EVENT_ID_HEADER, eventIdBytes));
-                        producer.send(rec1, callback);
+                    case 1: {
+                        ProducerRecord<String, byte[]> rec = new ProducerRecord<>(topicName, null, payload);
+                        rec.headers().add(new RecordHeader(EVENT_ID_HEADER, eventIdBytes));
+                        producer.send(rec, callback);
                         windowCount++;
                         windowBytes += payloadSize;
                         break;
-
-                    case 2:
-                        // Option 2: single topic, event-id header + mla-authz-bitmap
-                        ProducerRecord<String, byte[]> rec2 = new ProducerRecord<>(topicName, null, payload);
-                        rec2.headers().add(new RecordHeader(EVENT_ID_HEADER, eventIdBytes));
+                    }
+                    case 2: {
+                        ProducerRecord<String, byte[]> rec = new ProducerRecord<>(topicName, null, payload);
+                        rec.headers().add(new RecordHeader(EVENT_ID_HEADER, eventIdBytes));
                         byte[] bitmap = bitmapCache.get(eventId);
                         if (bitmap != null) {
-                            rec2.headers().add(new RecordHeader(MLA_AUTHZ_HEADER, bitmap));
+                            rec.headers().add(new RecordHeader(MLA_AUTHZ_HEADER, bitmap));
                         }
-                        producer.send(rec2, callback);
+                        producer.send(rec, callback);
                         windowCount++;
                         windowBytes += payloadSize;
                         break;
-
-                    case 3:
-                        // Option 3: route to per-audience topics
-                        String[] targets = EVENT_ID_TO_TOPICS.get(eventId);
+                    }
+                    case 3: {
+                        String[] targets = topicRouting.get(eventId);
                         if (targets != null) {
                             for (String target : targets) {
-                                ProducerRecord<String, byte[]> rec3 = new ProducerRecord<>(target, null, payload);
-                                rec3.headers().add(new RecordHeader(EVENT_ID_HEADER, eventIdBytes));
-                                producer.send(rec3, callback);
+                                ProducerRecord<String, byte[]> rec = new ProducerRecord<>(target, null, payload);
+                                rec.headers().add(new RecordHeader(EVENT_ID_HEADER, eventIdBytes));
+                                producer.send(rec, callback);
                                 windowCount++;
                                 windowBytes += payloadSize;
                             }
                         }
                         break;
+                    }
                 }
 
-                // Progress reporting
                 long now = System.currentTimeMillis();
                 if (now - windowStart >= reportIntervalMs) {
                     double elapsed = (now - windowStart) / 1000.0;
@@ -219,7 +225,6 @@ public class BenchmarkProducer {
                     windowBytes = 0;
                 }
             }
-
             producer.flush();
         }
 
@@ -230,7 +235,6 @@ public class BenchmarkProducer {
         double mbPerSec = totalBytes.get() / elapsedSec / (1024.0 * 1024.0);
         double avgLatency = sent > 0 ? totalLatency.get() / (double) sent : 0;
 
-        // Calculate percentiles
         int sampledCount = (int) Math.min(sampleIndex.get(), sampleSize);
         Arrays.sort(latencySamples, 0, sampledCount);
         int p50 = sampledCount > 0 ? latencySamples[(int) (sampledCount * 0.50)] : 0;

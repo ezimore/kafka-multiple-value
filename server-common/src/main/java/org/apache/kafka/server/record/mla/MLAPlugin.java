@@ -268,8 +268,9 @@ public class MLAPlugin implements RecordFetchPlugin {
         StringBuilder sb = new StringBuilder();
         for (String part : listeners.split(",")) {
             String trimmed = part.trim();
-            // Skip controller listeners
-            if (trimmed.toUpperCase().startsWith("CONTROLLER")) {
+            // Skip controller and SASL listeners (registry client has no SASL credentials)
+            String upper = trimmed.toUpperCase();
+            if (upper.startsWith("CONTROLLER") || upper.startsWith("SASL")) {
                 continue;
             }
             // Strip protocol prefix: "PLAINTEXT://host:port" -> "host:port"

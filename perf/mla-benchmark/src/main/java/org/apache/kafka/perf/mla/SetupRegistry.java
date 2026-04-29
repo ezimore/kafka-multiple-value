@@ -33,31 +33,23 @@ import java.util.Map;
 import java.util.Properties;
 
 /**
- * Sets up the Consumer ID Registry topic and registers consumers for MLA benchmarks.
+ * Sets up the Consumer ID Registry topic and registers consumers.
  *
  * Usage:
- *   java SetupRegistry <bootstrap> <registryTopic> [consumer1Principal consumer2Principal consumer3Principal]
+ *   java SetupRegistry <bootstrap> <registryTopic> <principal1> [principal2] ...
  *
- * Default principals (SASL mode):
- *   User:alice    -> ID 0 (consumer1)
- *   User:bob      -> ID 1 (consumer2)
- *   User:carol    -> ID 2 (consumer3)
+ * Each principal is registered with a sequential consumer ID starting from 0.
  */
 public class SetupRegistry {
 
     public static void main(String[] args) throws Exception {
-        if (args.length < 2) {
-            System.err.println("Usage: SetupRegistry <bootstrap> <registryTopic> [principal1 principal2 principal3]");
+        if (args.length < 3) {
+            System.err.println("Usage: SetupRegistry <bootstrap> <registryTopic> <principal1> [principal2] ...");
             System.exit(1);
         }
 
         String bootstrap = args[0];
         String registryTopic = args[1];
-
-        // Consumer principals — use args if provided, otherwise defaults
-        String principal1 = args.length > 2 ? args[2] : "User:alice";
-        String principal2 = args.length > 3 ? args[3] : "User:bob";
-        String principal3 = args.length > 4 ? args[4] : "User:carol";
 
         // Create the registry topic
         Properties adminProps = new Properties();
@@ -89,21 +81,15 @@ public class SetupRegistry {
         producerProps.put(ProducerConfig.ACKS_CONFIG, "all");
 
         try (KafkaProducer<String, byte[]> producer = new KafkaProducer<>(producerProps)) {
-            String[][] consumers = {
-                {principal1, "0"},  // consumer1
-                {principal2, "1"},  // consumer2
-                {principal3, "2"},  // consumer3
-            };
-
-            for (String[] entry : consumers) {
-                String principal = entry[0];
-                int consumerId = Integer.parseInt(entry[1]);
+            for (int i = 2; i < args.length; i++) {
+                String principal = args[i];
+                int consumerId = i - 2;
                 byte[] value = ByteBuffer.allocate(4).putInt(consumerId).array();
                 producer.send(new ProducerRecord<>(registryTopic, principal, value)).get();
                 System.out.printf("Registered %s -> consumer ID %d%n", principal, consumerId);
             }
         }
 
-        System.out.println("Registry setup complete.");
+        System.out.println("Registry setup complete. " + (args.length - 2) + " consumers registered.");
     }
 }

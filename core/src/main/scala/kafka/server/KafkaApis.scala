@@ -166,7 +166,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         val bufferSupplier = BufferSupplier.create()
         try {
           // Estimate output buffer size as same as input plus room for one empty batch header
-          val outputBuffer = ByteBuffer.allocate(memoryRecords.sizeInBytes() + DefaultRecordBatch.RECORD_BATCH_OVERHEAD)
+          val outputBuffer = ByteBuffer.allocate(memoryRecords.sizeInBytes() + DefaultRecordBatch.RECORD_BATCH_OVERHEAD + 256)
           var hasFiltered = false
           // Track the highest offset seen across all batches (for offset advancement)
           var highestOriginalOffset: Long = -1
